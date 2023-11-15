@@ -1,10 +1,8 @@
 use minhook::MinHook;
 
-use std::{string::FromUtf8Error, char, fs::{File, remove_file, OpenOptions}, io::{Write, Take, stdout, stdin, Read}, path::Path, thread::sleep, time::Duration, ptr::{self, null}, mem, os::windows::ffi::EncodeWide};
+use std::{char, io::{stdout, stdin, Read}, ptr::{self}};
 
-use wchar::{wchar_t, wchz};
-
-use toy_arms::{internal::{self, module::Module, GameObject, cast}, derive::GameObject, utils::{detect_keydown, keyboard::VirtualKeyCode}};
+use toy_arms::{internal::{self, module::Module, GameObject, cast}, derive::GameObject};
 
 internal::create_entrypoint!(main_thread);
 
@@ -44,7 +42,7 @@ macro_rules! function_from_address {
 }
 
 unsafe fn get_fname_from_gnames_at_idx(gnames: *mut TArray, idx: usize) -> Option<String>{
-    if((*gnames).get(idx) == 0){
+    if (*gnames).get(idx) == 0 {
         return None;
     }
 
@@ -79,7 +77,7 @@ unsafe fn get_outer_uobject_name(gnames: *mut TArray, uobject_address: usize) ->
 
     let outer_address: usize = *cast!(uobject_address + 0x38, usize);
 
-    if(outer_address != 0){
+    if outer_address != 0 {
         str_to_return.push_str(&get_outer_uobject_name(gnames, outer_address));
     }
 
@@ -87,7 +85,7 @@ unsafe fn get_outer_uobject_name(gnames: *mut TArray, uobject_address: usize) ->
 }
 
 unsafe fn get_uobject_from_address(gnames: *mut TArray, uobject_address: usize, module_base: usize, dont_recurse: bool) -> Option<UObject>{
-    if(uobject_address == 0){
+    if uobject_address == 0 {
         return None;
     }
 
@@ -95,7 +93,7 @@ unsafe fn get_uobject_from_address(gnames: *mut TArray, uobject_address: usize, 
 
     let mut class_name: Option<String> = None;
 
-    if(!dont_recurse){
+    if !dont_recurse {
         class_name = Some(get_uobject_from_address(gnames, *cast!(uobject_address + 0x48, usize), module_base, true).unwrap().name);
     }
 
@@ -103,7 +101,7 @@ unsafe fn get_uobject_from_address(gnames: *mut TArray, uobject_address: usize, 
 
     let outer_address: usize = *cast!(uobject_address + 0x38, usize);
 
-    if(outer_address != 0){
+    if outer_address != 0 {
         name.push_str(&get_outer_uobject_name(gnames, outer_address));
     }
 
@@ -118,7 +116,7 @@ unsafe fn get_uobject_from_gobjobjects_at_idx(gnames: *mut TArray, idx: usize, g
     return get_uobject_from_address(gnames, uobject_address, module_base, false);
 }
 
-unsafe fn dump_names(gnames: *mut TArray, module: &Module){
+unsafe fn dump_names(gnames: *mut TArray, _module: &Module){
     
     let mut names_string = String::new();
 
@@ -128,7 +126,7 @@ unsafe fn dump_names(gnames: *mut TArray, module: &Module){
     loop{
         let maybe_name: Option<String> = get_fname_from_gnames_at_idx(gnames, i);
 
-        if(maybe_name.is_some()){
+        if maybe_name.is_some() {
             invalid_count = 0;
             names_string.push_str("[");
             names_string.push_str(&i.to_string());
@@ -138,7 +136,7 @@ unsafe fn dump_names(gnames: *mut TArray, module: &Module){
         }
         else{
             invalid_count = invalid_count + 1;
-            if(invalid_count > 10000){
+            if invalid_count > 10000 {
                 break;
             }
         }
@@ -268,7 +266,7 @@ unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TA
     loop{
         let maybe_object: Option<UObject> = get_uobject_from_gobjobjects_at_idx(gnames, i, gobjects, module.base_address);
 
-        if(maybe_object.is_some()){
+        if maybe_object.is_some() {
             let object: UObject = maybe_object.unwrap();
             invalid_count = 0;
 
@@ -276,7 +274,7 @@ unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TA
             names_string.push_str(&format!("{:x}", &object.address));
             names_string.push_str("] ");
             names_string.push_str("[");
-            if(object.class_name.is_some()){
+            if object.class_name.is_some() {
                 names_string.push_str(&format!("{}", object.class_name.clone().unwrap()));
             }
             names_string.push_str("] ");
@@ -287,7 +285,7 @@ unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TA
         }
         else{
             invalid_count = invalid_count + 1;
-            if(invalid_count > 100){
+            if invalid_count > 100 {
                 break;
             }
         }
@@ -305,17 +303,17 @@ unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TA
  */
 unsafe fn get_uobject_from_vec(name: String, class: Option<String>, vec: &Vec<UObject>) -> Option<&UObject>{
     for uobject in vec{
-        if(class.is_some()){
-            if(uobject.name == name){
-                if(uobject.class_name.is_some()){
-                    if(uobject.class_name.clone().unwrap() == class.clone().unwrap()){
+        if class.is_some() {
+            if uobject.name == name {
+                if uobject.class_name.is_some() {
+                    if uobject.class_name.clone().unwrap() == class.clone().unwrap() {
                         return Some(uobject);
                     }
                 }
             }
         }
         else{
-            if(uobject.name == name){
+            if uobject.name == name {
                 return Some(uobject);
             }
         }
@@ -330,7 +328,7 @@ unsafe fn get_uobject_from_vec(name: String, class: Option<String>, vec: &Vec<UO
  */
 fn get_uobject_from_vec_by_address(uobject_address: usize, vec: &Vec<UObject>) -> Option<&UObject>{
     for uobject in vec{
-        if(uobject.address == uobject_address){
+        if uobject.address == uobject_address {
             return Some(&uobject);
         }
     }
@@ -439,7 +437,7 @@ struct ServerSelectCharacterParams{
  */
 unsafe fn get_player_controller_address(parsed_gobjects: &Vec<UObject>) -> Option<usize>{
     for uobject in parsed_gobjects{
-        if(uobject.name.contains("PoplarPlayerController") && uobject.name.contains("PersistentLevel.TheWorld") && uobject.class_name == Some("PoplarGame.PoplarPlayerController".to_string())){
+        if uobject.name.contains("PoplarPlayerController") && uobject.name.contains("PersistentLevel.TheWorld") && uobject.class_name == Some("PoplarGame.PoplarPlayerController".to_string()) {
             println!("{}", uobject.name);
             return Some(uobject.address);
         }
@@ -501,7 +499,7 @@ fn main_thread() {
 
         println!("Dumping objects...");
 
-        let uobjects: Vec<UObject> = parse_uobjects(gnames, &module, gobjects);
+        let _uobjects: Vec<UObject> = parse_uobjects(gnames, &module, gobjects);
 
         println!("Objects dump complete!");
 
@@ -539,8 +537,8 @@ fn main_thread() {
 
         let _ = MinHook::enable_all_hooks().unwrap();
 
-        let stdin = stdin();
-        let mut stdout = stdout();
+        let _stdin = stdin();
+        let _stdout = stdout();
 
         loop{
 
