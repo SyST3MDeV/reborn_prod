@@ -1,6 +1,7 @@
 use minhook::MinHook;
+use wchar::wchz;
 
-use std::{char, io::{stdout, stdin, Read}, ptr::{self}};
+use std::{io::{stdout, stdin}, ptr::{self}, time::Duration, collections::HashMap, fs};
 
 use toy_arms::{internal::{self, module::Module, GameObject, cast}, derive::GameObject};
 
@@ -11,18 +12,18 @@ const GOBJECTS_OFFSET: usize = 0x35152D8;
 const PROCESSEVENT_OFFSET: usize = 0x109ca0;
 const STATICCONSTRUCTOBJECT_OFFSET: usize = 0x008c050;
 const ENGINEPROCESSCOMMAND_OFFSET: usize = 0x01fca00;
-const ERROR_FUNC_OFFSET: usize = 0x00646c0;
-const INIT_LISTEN_OFFSET: usize = 0x0c21e30;
 
-static mut orig_processevent_addr: usize = 0;
-static mut orig_staticcreateobject_addr: usize = 0;
-static mut orig_engine_exec_addr: usize = 0;
-static mut orig_error_func_addr: usize = 0;
+static mut ORIG_PROCESSEVENT_ADDR: usize = 0;
+static mut ORIG_STATICCREATEOBJECT_ADDR: usize = 0;
+static mut ORIG_ENGINE_EXEC_ADDR: usize = 0;
 
-static mut engine_addr: usize = 0;
-static mut foutputdevice: usize = 0;
-static mut module_base_global: usize = 0;
-static mut static_construct_object_param_9: usize = 0;
+static mut ENGINE_ADDR: usize = 0;
+static mut FOUTPUTDEVICE: usize = 0;
+static mut MODULE_BASE_GLOBAL: usize = 0;
+static mut GNAMES_GLOBAL: Option<*mut TArray> = None;
+static mut GOBJECTS_GLOBAL: Option<*mut TArray> = None;
+
+static mut CONFIG_GLOBAL: Option<Config> = None;
 
 #[derive(GameObject)]
 struct TArray {
@@ -33,12 +34,6 @@ impl TArray {
     unsafe fn get(&self, idx: usize) -> usize {
         return *cast!(self.pointer as usize + (0x8 * idx), usize);
     }
-}
-
-macro_rules! function_from_address {
-    ($address:expr, $t:ty) => {
-        std::mem::transmute::<*const (), $t>($address as _)
-    };
 }
 
 unsafe fn get_fname_from_gnames_at_idx(gnames: *mut TArray, idx: usize) -> Option<String>{
@@ -62,7 +57,6 @@ unsafe fn get_fname_from_gnames_at_idx(gnames: *mut TArray, idx: usize) -> Optio
 
 struct UObject{
     address: usize,
-    name_index: u32,
     name: String,
     class_name: Option<String>
 }
@@ -107,7 +101,7 @@ unsafe fn get_uobject_from_address(gnames: *mut TArray, uobject_address: usize, 
 
     name.push_str(&get_fname_from_gnames_at_idx(gnames, name_index as usize).unwrap());
 
-    return Some(UObject { address: uobject_address, name_index: name_index, name: name, class_name: class_name});
+    return Some(UObject { address: uobject_address, name: name, class_name: class_name});
 }
 
 unsafe fn get_uobject_from_gobjobjects_at_idx(gnames: *mut TArray, idx: usize, gobjects: *mut TArray, module_base: usize) -> Option<UObject>{
@@ -176,7 +170,7 @@ unsafe fn get_camera(parsed_gobjects: &'static Vec<UObject>) -> Option<&'static 
 /**
  * Gets the currently instantiated PoplarPlayerInput UObject
  */
-unsafe fn get_input(parsed_gobjects: &'static Vec<UObject>) -> Option<&'static UObject>{
+unsafe fn get_input(parsed_gobjects: &Vec<UObject>) -> Option<&UObject>{
     //[2a36c4a9850] [PoplarGame.PoplarPlayerInput] PoplarPlayerController.PersistentLevel.TheWorld.Slums_P.PoplarPlayerInput
 
     for uobject in parsed_gobjects{
@@ -194,7 +188,7 @@ unsafe fn get_input(parsed_gobjects: &'static Vec<UObject>) -> Option<&'static U
 /**
  * Sets the mouse sensitivity, relies on the parsed_gobjects being refreshed post level change
  */
-unsafe fn set_mouse_sensitivity(parsed_gobjects: &'static Vec<UObject>, x: f32, y: f32){
+unsafe fn set_mouse_sensitivity(parsed_gobjects: &Vec<UObject>, x: f32, y: f32){
     let camera_uobject = get_input(parsed_gobjects).unwrap().address;
 
     let fov_ufunction: usize = get_uobject_from_vec("PlayerInput.Engine.SetSensitivity".to_string(), Some("Core.Function".to_string()), parsed_gobjects).unwrap().address;
@@ -255,7 +249,7 @@ unsafe fn set_subtitle_state(parsed_gobjects: &Vec<UObject>, enabled: bool){
  * This also has the awful side effect of duplicating a TON of memory, which while probably not catastrophic in the long run is just bad programming practice
  * In the future this will be replaced with proper methods that interpret memory, instead of parsing the whole thing into a Vec
  */
-unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TArray) -> Vec<UObject>{
+unsafe fn parse_uobjects(gnames: *mut TArray, module_base: usize, gobjects: *mut TArray) -> Vec<UObject>{
     let mut uobjects: Vec<UObject> = Vec::new();
 
     let mut names_string = String::new();
@@ -264,7 +258,7 @@ unsafe fn parse_uobjects(gnames: *mut TArray, module: &Module, gobjects: *mut TA
     let mut i = 0;
 
     loop{
-        let maybe_object: Option<UObject> = get_uobject_from_gobjobjects_at_idx(gnames, i, gobjects, module.base_address);
+        let maybe_object: Option<UObject> = get_uobject_from_gobjobjects_at_idx(gnames, i, gobjects, module_base);
 
         if maybe_object.is_some() {
             let object: UObject = maybe_object.unwrap();
@@ -343,9 +337,70 @@ fn get_uobject_from_vec_by_address(uobject_address: usize, vec: &Vec<UObject>) -
 unsafe fn fake_process_event(uobject_address: usize, ufunction_address: usize, params: usize) -> usize{
     type ProcessEvent = unsafe extern "thiscall" fn(uobject: usize, ufunction: usize, params: usize) -> usize;
 
-    let process_event: ProcessEvent = unsafe { std::mem::transmute(orig_processevent_addr)};
+    let process_event: ProcessEvent = unsafe { std::mem::transmute(ORIG_PROCESSEVENT_ADDR)};
+
+    let ufunction: Option<UObject> = get_uobject_from_address(GNAMES_GLOBAL.unwrap(), ufunction_address, MODULE_BASE_GLOBAL, false);
+
+    let ufunction_name = ufunction.unwrap().name;
+
+    if ufunction_name == "GameInfo.Engine.OnStartOnlineGameComplete" {
+        on_level_start_callback();
+    }
 
     return process_event(uobject_address, ufunction_address, params);
+}
+
+unsafe fn on_level_start_callback(){
+    let character_ipc_dict: HashMap<&str, &str> = HashMap::from([
+        ("WaterMonk", "GD_WaterMonk.NameId_WaterMonk"),
+        ("SunPriestess", "GD_SunPriestess.NameId_SunPriestess_Poplar"),
+        ("SoulCollector", "GD_SoulCollector.NameId_SoulCollector"),
+        ("PlagueBringer", "GD_PlagueBringer.NameId_PlagueBringer"),
+        ("RocketHawk", "GD_RocketHawk.NameId_RocketHawk"),
+        ("DwarvenWarrior", "GD_DwarvenWarrior.NameId_DwarvenWarrior"),
+        ("AssaultJump", "GD_AssaultJump.NameId_AssaultJump_Poplar"),
+        ("DarkAssassin", "GD_DarkAssassin.NameId_DarkAssassin"),
+        ("LeapingLuchador", "GD_LeapingLuchador.NameId_LeapingLuchador"),
+        ("Bombirdier", "GD_Bombirdier.NameId_Bombirdier"),
+        ("Blackguard", "GD_Blackguard.NameId_Blackguard"),
+        ("PapaShotgun", "GD_PapaShotgun.NameId_PapaShotgun"),
+        ("SpiritMech", "GD_SpiritMech.NameId_SpiritMech"),
+        ("IceGolem", "GD_IceGolem.NameId_IceGolem"),
+        ("SideKick", "GD_Sidekick.NameId_SideKick"),
+        ("TacticalBuilder", "GD_TacticalBuilder.NameId_TacticalBuilder"),
+        ("GentSniper", "gd_gentsniper.NameId_GentSniper"),
+        ("MutantFist", "GD_MutantFist.NameId_MutantFist"),
+        ("TribalHealer", "gd_tribalhealer.NameId_TribalHealer"),
+        ("MachineGunner", "gd_machinegunner.NameId_MachineGunner"),
+        ("ChaosMage", "GD_ChaosMage.NameId_ChaosMage"),
+        ("ModernSoldier", "gd_modernsoldier.NameId_ModernSoldier_Poplar"),
+        ("CornerSneaker", "GD_CornerSneaker.NameId_CornerSneaker"),
+        ("MageBlade", "GD_MageBlade.NameId_MageBlade_Poplar"),
+        ("DeathBlade", "gd_deathblade.NameId_DeathBlade"),
+        ("RogueCommander", "GD_RogueCommander.NameId_RogueCommander"),
+        ("BoyAndDjinn", "GD_BoyAndDjinn.NameId_BoyAndDjinn"),
+        ("DarkElf", "gd_darkelfranger.NameId_DarkElfRanger"),
+        ("PenguinMech", "GD_PenguinMech.NameId_PenguinMech"),
+        ("RogueSoldier", "GD_RogueSoldier.NameId_RogueSoldier"),
+    ]);
+
+    let uobjects = parse_uobjects(GNAMES_GLOBAL.unwrap(), MODULE_BASE_GLOBAL, GOBJECTS_GLOBAL.unwrap());
+
+    let player_controller: usize = get_player_controller_address(&uobjects).unwrap();
+
+    let function_object: usize = get_uobject_from_vec("PoplarPlayerController.PoplarGame.SwitchPoplarPlayerClass".to_owned(), Some("Core.Function".to_owned()), &uobjects).unwrap().address;
+
+    let class_to_switch_to: usize = get_uobject_from_vec(character_ipc_dict[&CONFIG_GLOBAL.clone().unwrap().characterToLoad as &str].to_owned(), Some("PoplarGame.PoplarPlayerNameIdentifierDefinition".to_owned()), &uobjects).unwrap().address;
+
+    let params: SetClassParams = SetClassParams { class: class_to_switch_to };
+                
+    fake_process_event(player_controller, function_object, ptr::addr_of!(params) as usize);
+
+    set_fov(&uobjects, str::parse::<f32>(&CONFIG_GLOBAL.clone().unwrap().FOV).unwrap());
+
+    set_mouse_sensitivity(&uobjects, str::parse::<f32>(&CONFIG_GLOBAL.clone().unwrap().MouseSensitivityX).unwrap(), str::parse::<f32>(&CONFIG_GLOBAL.clone().unwrap().MouseSensitivityY).unwrap());
+
+    set_subtitle_state(&uobjects, str::parse::<bool>(&CONFIG_GLOBAL.clone().unwrap().subtitles).unwrap());
 }
 
 struct ConsoleCommandParams{
@@ -364,7 +419,7 @@ struct TcpListenParams{
 unsafe fn fake_static_construct_object(param1: usize, param2: usize, param3: usize, param4: usize, param5: usize, param6: usize, param7: usize, param8: usize, param9: usize) -> usize{    
     type StaticConstructObject = unsafe extern "thiscall" fn(param1: usize, param2: usize, param3: usize, param4: usize, param5: usize, param6: usize, param7: usize, param8: usize, param9: usize) -> usize;
 
-    let static_construct_object: StaticConstructObject = unsafe { std::mem::transmute(orig_staticcreateobject_addr)};
+    let static_construct_object: StaticConstructObject = unsafe { std::mem::transmute(ORIG_STATICCREATEOBJECT_ADDR)};
 
     return static_construct_object(param1, param2, param3, param4, param5, param6, param7, param8, param9);
 }
@@ -376,10 +431,10 @@ unsafe fn fake_static_construct_object(param1: usize, param2: usize, param3: usi
 unsafe fn fake_engine_exec(game_engine_address: usize, command: usize, f_output_device: usize) -> i32{
     type EngineCallCommand = unsafe extern "thiscall" fn(game_engine_address: usize, command: usize, f_output_device: usize) -> i32;
 
-    let engine_call_command: EngineCallCommand = unsafe{ std::mem::transmute(orig_engine_exec_addr)};
+    let engine_call_command: EngineCallCommand = unsafe{ std::mem::transmute(ORIG_ENGINE_EXEC_ADDR)};
 
-    engine_addr = game_engine_address;
-    foutputdevice = f_output_device;
+    ENGINE_ADDR = game_engine_address;
+    FOUTPUTDEVICE = f_output_device;
 
     return engine_call_command(game_engine_address, command, f_output_device);
 }
@@ -463,10 +518,42 @@ struct FStringBody{
     body: [usize]
 }
 
+#[derive(serde::Deserialize, Clone)]
+struct Config{
+    FOV: String,
+    MouseSensitivityX: String,
+    MouseSensitivityY: String,
+    subtitles: String,
+    mapToLoad: String,
+    characterToLoad: String
+}
+
 fn main_thread() {
+    let map_ipc_dict: HashMap<&str, Vec<u16>> = HashMap::from([
+        ("PvE_Prologue_P", wchz!("open PvE_Prologue_P").to_vec()),
+        ("Caverns_P", wchz!("open Caverns_P").to_vec()),
+        ("Portal_P", wchz!("open Portal_P").to_vec()),
+        ("Captains_P", wchz!("open Captains_P").to_vec()),
+        ("Evacuation_P", wchz!("open Evacuation_P").to_vec()),
+        ("Ruins_P", wchz!("open Ruins_P").to_vec()),
+        ("Observatory_p", wchz!("open Observatory_p").to_vec()),
+        ("Refinery_P", wchz!("open Refinery_P").to_vec()),
+        ("Cathedral_P", wchz!("open Cathedral_P").to_vec()),
+        ("Slums_P", wchz!("open Slums_P").to_vec()),
+        ("Toby_Raid_P", wchz!("open Toby_Raid_P").to_vec()),
+        ("CullingFacility_P", wchz!("open CullingFacility_P").to_vec()),
+        ("TallTales_P", wchz!("open TallTales_P").to_vec()),
+        ("Heart_Ekkunar_P", wchz!("open Heart_Ekkunar_P").to_vec()),
+    ]);
+
     println!("ReBorn Injected!");
 
+    println!("Reading config.json...");
+
+    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").unwrap()).unwrap();
+
     println!("Waiting for module to become valid...");
+
     loop{
         if Module::from_name("Battleborn.exe").is_some(){
             break;
@@ -480,10 +567,14 @@ fn main_thread() {
     println!("Module base address: {:x}", module_base_address);
 
     unsafe{
-        module_base_global = module_base_address;
+        CONFIG_GLOBAL = Some(config.clone());
+        MODULE_BASE_GLOBAL = module_base_address;
 
         let gnames: *mut TArray = TArray::from_raw(module.read(GNAMES_OFFSET)).unwrap();
         let gobjects: *mut TArray = TArray::from_raw(module.read(GOBJECTS_OFFSET)).unwrap();
+
+        GNAMES_GLOBAL = Some(gnames);
+        GOBJECTS_GLOBAL = Some(gobjects);
 
         println!("Dumping names...");
 
@@ -491,15 +582,9 @@ fn main_thread() {
 
         println!("Names dump complete!");
 
-        /*
-        println!("Waiting for a few secs to hit menu to dump objects...");
-
-        sleep(Duration::from_secs(10));
-        */
-
         println!("Dumping objects...");
 
-        let _uobjects: Vec<UObject> = parse_uobjects(gnames, &module, gobjects);
+        let _uobjects: Vec<UObject> = parse_uobjects(gnames, module_base_address, gobjects);
 
         println!("Objects dump complete!");
 
@@ -511,7 +596,7 @@ fn main_thread() {
 
         println!("Creating ProcessEvent hook...");
 
-        orig_processevent_addr = MinHook::create_hook(process_event as _, fake_process_event as _).unwrap() as usize;
+        ORIG_PROCESSEVENT_ADDR = MinHook::create_hook(process_event as _, fake_process_event as _).unwrap() as usize;
 
         println!("Creating StaticConstructObject reference...");
 
@@ -521,7 +606,7 @@ fn main_thread() {
 
         println!("Creating StaticConstructObject hook...");
 
-        orig_staticcreateobject_addr = MinHook::create_hook(static_construct_object as _, fake_static_construct_object as _).unwrap() as usize;
+       // ORIG_STATICCREATEOBJECT_ADDR = MinHook::create_hook(static_construct_object as _, fake_static_construct_object as _).unwrap() as usize;
 
         println!("Creating EngineCallCommand reference...");
 
@@ -531,7 +616,7 @@ fn main_thread() {
 
         println!("Creating EngineCallCommand hook...");
 
-        orig_engine_exec_addr = MinHook::create_hook(engine_call_command as _, fake_engine_exec as _).unwrap() as usize;
+        //ORIG_ENGINE_EXEC_ADDR = MinHook::create_hook(engine_call_command as _, fake_engine_exec as _).unwrap() as usize;
 
         println!("Enabling all hooks...");
 
@@ -540,8 +625,13 @@ fn main_thread() {
         let _stdin = stdin();
         let _stdout = stdout();
 
-        loop{
+        println!("Loading map...");
 
+        let command_1 = map_ipc_dict[&config.mapToLoad as &str].as_slice();
+        engine_call_command(_uobjects[0].address + 0x25ebde8, ptr::addr_of!(*command_1) as *const () as usize, 0);
+
+        loop{
+            
         }
     }
 }
